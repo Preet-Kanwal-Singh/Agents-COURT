@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Env
+.env
+*.env
+
+# Logs / output
+*.log
+output/
+outputs/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Project-specific
+# If you add a local query history or cache at any point
+query_cache/
+*.jsonl
