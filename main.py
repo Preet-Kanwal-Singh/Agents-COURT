@@ -1,11 +1,13 @@
 """
-Phase 1–3 test runner.
+Phase 1–5 test runner.
 
 Usage:
     python main.py                          # phase 1, virgo, benchmark query
     python main.py --role pisces            # phase 1, different role
     python main.py --phase 2               # phase 2, all council roles
     python main.py --phase 3               # phase 3, council + review round
+    python main.py --phase 4               # phase 4, full pipeline (router wired in)
+    python main.py --phase 5               # phase 5, router isolation test
     python main.py --check                 # health check only, no query
     python main.py --query "..."           # custom query string
 """
@@ -20,6 +22,7 @@ from core import (
 )
 from core.runner import run_aggregated_review
 from core.runner import run_full_pipeline
+from core.router import run_router
 from core.synthesis import format_synthesis_output
 
 TEST_QUERY = (
@@ -186,10 +189,45 @@ async def run_phase4(query: str) -> None:
     print(format_synthesis_output(result))
 
 
+async def run_phase5(query: str) -> None:
+    from core.router import compute_final_weights
+
+    print(f"\n— Phase 5: router isolation test —")
+    print(f"  Query length: {len(query)} chars\n")
+
+    result = await run_router(query)
+
+    print(_SEP)
+    print(f"ROUTER  |  classification: {result.classification}  |  stage: {result.stage}")
+    print(_SEP)
+    print("  initial_weights (post-modifier):")
+    for role, w in sorted(result.initial_weights.items(), key=lambda x: -x[1]):
+        bar = "█" * int(w * 20)
+        print(f"    {role:<10} {w:.3f}  {bar}")
+    print(f"\n  modifiers:")
+    print(f"    conclusion_implied: {result.modifiers.get('conclusion_implied', False)}")
+    print(f"    context_dense:      {result.modifiers.get('context_dense', False)}")
+    print(f"\n  reasoning: {result.reasoning}")
+    print(_SEP)
+
+    if query == TEST_QUERY:
+        hamon_pass = (
+            result.classification == "pisces"
+            and result.modifiers.get("conclusion_implied") is True
+        )
+        status = "PASS" if hamon_pass else "FAIL"
+        print(f"\nHAMON pass condition [{status}]")
+        if not hamon_pass:
+            print(f"  Expected: classification=pisces, conclusion_implied=True")
+            print(f"  Got:      classification={result.classification}, "
+                  f"conclusion_implied={result.modifiers.get('conclusion_implied')}")
+        print()
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Archivist Council test runner")
-    parser.add_argument("--phase", type=int, default=1, choices=[1, 2, 3, 4],
-                        help="Phase to run: 1 = single role, 2 = full council, 3 = council + review (default: 1)")
+    parser.add_argument("--phase", type=int, default=1, choices=[1, 2, 3, 4, 5],
+                        help="Phase to run: 1=single role, 2=full council, 3=council+review, 4=full pipeline, 5=router (default: 1)")
     parser.add_argument("--role", default="virgo",
                         choices=["virgo", "pisces", "critic", "seer", "archivist"],
                         help="Role to call (phase 1 only, ignored in phase 2/3)")
@@ -205,7 +243,9 @@ async def main() -> None:
 
     query = args.query or TEST_QUERY
 
-    if args.phase == 4:
+    if args.phase == 5:
+        await run_phase5(query)
+    elif args.phase == 4:
         await run_phase4(query)
     elif args.phase == 3:
         await run_with_review(query)

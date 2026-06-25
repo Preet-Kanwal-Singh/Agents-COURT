@@ -2,6 +2,7 @@ from .models import Role, ROLE_MODELS, ROLE_TIMEOUTS, RoleResponse
 from .ollama_client import call_role, ping_ollama, list_loaded_models
 from .prompt_loader import get_system_prompt, list_available_roles
 from .runner import run_sequential, COUNCIL_ROLES
+from .router import RouterResult, run_router, apply_modifiers, compute_final_weights, get_weight_deltas
 
 __all__ = [
     # models

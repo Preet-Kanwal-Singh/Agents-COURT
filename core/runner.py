@@ -17,6 +17,7 @@ from .models import Role, RoleResponse
 from .ollama_client import call_role
 from .prompt_loader import get_system_prompt
 from .synthesis import build_context_packet, run_archivist, format_synthesis_output
+from .router import run_router, compute_final_weights
 from .review import (
     anonymize, build_review_prompt, extract_json, validate_review,
     normalize_scores, flag_quality_issues, deanonymize_scores,
@@ -193,20 +194,27 @@ async def run_aggregated_review(
 async def run_full_pipeline(
     query: str,
     num_reviewers: int = 4,
-    classification: str = "unclassified",
 ):
     """
-    Full pipeline: sequential council → aggregated review → Archivist synthesis.
+    Full pipeline: router → sequential council → aggregated review → Archivist synthesis.
     Returns SynthesisResult. Caller handles formatting and display.
+
+    Phase 5: router runs first and owns classification. Its output feeds:
+      - run_aggregated_review (classification string for reviewer context)
+      - build_context_packet (full RouterResult + final_weights)
     """
+    router = await run_router(query)
+
     role_responses = await run_sequential(query)
 
     aggregated_review = await run_aggregated_review(
         query=query,
         council_responses=role_responses,
         num_reviewers=num_reviewers,
-        classification=classification,
+        classification=router.classification,
     )
+
+    final_weights = compute_final_weights(router.initial_weights, aggregated_review.review_votes)
 
     role_outputs = {
         r.role.value.lower(): r.content if r.ok else f"[{r.role.value} failed: {r.error}]"
@@ -219,6 +227,8 @@ async def run_full_pipeline(
         review_votes=aggregated_review.review_votes,
         blind_spots=aggregated_review.blind_spots,
         collective_misses=aggregated_review.collective_misses,
+        router=router,
+        final_weights=final_weights,
     )
 
     return await run_archivist(packet)

@@ -1,31 +1,17 @@
 """
-core/synthesis.py — Phase 4: Archivist synthesis layer.
+core/synthesis.py — Archivist synthesis layer.
 
 Owns:
   build_context_packet()    — assembles the full prompt the Archivist receives
   run_archivist()           — calls gemma4:latest via Ollama
   format_synthesis_output() — separates Archivist prose from pipeline metadata
 
-Phase 4 constraints:
-  - final_weights == review_votes (router not yet active — Phase 5 dependency)
-  - classification defaults to "unclassified" — do not fabricate router output
-  - weight_delta is not computed dynamically (no initial_weights without router),
-    but the Virgo tension from Phase 3 is flagged explicitly: Virgo received 0.450
-    on a pisces-signal query; expected weight under router is ~0.10. Delta exceeds
-    the 0.10 threshold — the Archivist is instructed to name it.
-
-Wiring into runner.py (Phase 4 addition):
-  from core.synthesis import build_context_packet, run_archivist, format_synthesis_output
-
-  packet = build_context_packet(
-      query=query,
-      role_outputs={r.role.value.lower(): r.content for r in role_responses},
-      review_votes=aggregated_review.review_votes,
-      blind_spots=[r.blind_spot_detail for r in aggregated_review.reviews],
-      collective_misses=[r.collective_miss for r in aggregated_review.reviews],
-  )
-  synthesis = await run_archivist(packet)
-  print(format_synthesis_output(synthesis))
+Phase 5 changes:
+  - build_context_packet now accepts a RouterResult and pre-computed final_weights.
+  - classification, initial_weights, modifiers, and reasoning are all live from the router.
+  - final_weights = initial_weights * 0.6 + review_votes * 0.4 (computed in runner).
+  - weight_delta computed dynamically; any role with |final - initial| > 0.10 is
+    flagged and the Archivist is instructed to name the tension.
 """
 
 from __future__ import annotations
@@ -62,7 +48,8 @@ def build_context_packet(
     review_votes: dict[str, float],        # aggregated, deanonymized weights
     blind_spots: list[str],                # one per reviewer pass
     collective_misses: list[str],          # one per reviewer pass — mandatory content
-    classification: str = "unclassified",  # placeholder until Phase 5 router
+    router,                                # RouterResult from core.router (duck-typed)
+    final_weights: dict[str, float],       # computed by runner: initial*0.6 + review*0.4
 ) -> str:
     """
     Constructs the full context packet sent to the Archivist as the user prompt.
@@ -79,11 +66,50 @@ def build_context_packet(
         for role, output in role_outputs.items()
     )
 
-    # --- Weights (sorted descending for readability) ---
-    weight_lines = "\n".join(
-        f"  {role}: {score:.3f}"
+    # --- Router section ---
+    router_weight_lines = "\n".join(
+        f"    {role}: {w:.3f}"
+        for role, w in sorted(router.initial_weights.items(), key=lambda x: -x[1])
+    )
+
+    # --- Review votes (raw reviewer output) ---
+    review_vote_lines = "\n".join(
+        f"    {role}: {score:.3f}"
         for role, score in sorted(review_votes.items(), key=lambda x: -x[1])
     )
+
+    # --- Final weights (blended) ---
+    final_weight_lines = "\n".join(
+        f"    {role}: {score:.3f}"
+        for role, score in sorted(final_weights.items(), key=lambda x: -x[1])
+    )
+
+    # --- Weight deltas: any role where |final - initial| > 0.10 ---
+    deltas = {
+        role: abs(final_weights.get(role, 0.0) - router.initial_weights[role])
+        for role in router.initial_weights
+        if abs(final_weights.get(role, 0.0) - router.initial_weights[role]) > 0.10
+    }
+
+    if deltas:
+        delta_lines = "\n".join(
+            f"    {role}: initial={router.initial_weights[role]:.3f} -> "
+            f"final={final_weights.get(role, 0.0):.3f} (delta={d:.3f})"
+            for role, d in sorted(deltas.items(), key=lambda x: -x[1])
+        )
+        delta_instruction = (
+            "Flagged weight deltas (|final - initial| > 0.10):\n"
+            + "\n".join(
+                f"  {role}: initial={router.initial_weights[role]:.3f} -> "
+                f"final={final_weights.get(role, 0.0):.3f} (delta={d:.3f})"
+                for role, d in sorted(deltas.items(), key=lambda x: -x[1])
+            )
+            + "\nFor each flagged role, name the tension: what does the review round's "
+            + "deviation from the router's prior reveal about what this query actually needed?"
+        )
+    else:
+        delta_lines = "    none"
+        delta_instruction = ""
 
     # --- Review round: blind spots and collective misses ---
     blind_spot_lines = "\n".join(
@@ -95,30 +121,28 @@ def build_context_packet(
         for i, cm in enumerate(collective_misses)
     )
 
-    # --- Weight delta note (Phase 4 hardcoded — Phase 5 computes dynamically) ---
-    # Virgo at 0.450 on a pisces-signal query. Under the router's pisces-signal
-    # vector (virgo: 0.10), the delta would be 0.35 — well above the 0.10 threshold
-    # that triggers mandatory tension-naming in the synthesis.
-    weight_delta_note = (
-        "Router not yet active — final_weights == review_votes (Phase 5 dependency).\n"
-        "  Phase 3 finding: Virgo received 0.450 on a query expected to classify as\n"
-        "  pisces-signal (expected router weight ~0.10). Delta ~0.35 exceeds the 0.10\n"
-        "  threshold. The Archivist must name this tension in the synthesis."
-    )
-
     packet = f"""QUERY:
 {query.strip()}
 
 ROUTER:
-  classification: {classification}
-  initial_weights: N/A ({weight_delta_note})
+  classification: {router.classification}  stage: {router.stage}
+  initial_weights (post-modifier):
+{router_weight_lines}
+  modifiers: conclusion_implied={router.modifiers.get('conclusion_implied', False)}  context_dense={router.modifiers.get('context_dense', False)}
+  reasoning: {router.reasoning}
 
 ROLE OUTPUTS:
 {role_section}
 
 REVIEW SUMMARY:
-  final_weights (= review_votes, router not yet active):
-{weight_lines}
+  review_votes (mean across reviewer passes):
+{review_vote_lines}
+
+  final_weights (initial_weights * 0.6 + review_votes * 0.4):
+{final_weight_lines}
+
+  weight_delta (|final - initial| > 0.10):
+{delta_lines}
 
   blind_spots (one per reviewer pass):
 {blind_spot_lines}
@@ -132,9 +156,7 @@ SYNTHESIS INSTRUCTIONS:
 Synthesise in full Archivist voice.
 Weight the role outputs according to final_weights above.
 Address the collective misses directly — they are mandatory, not optional context.
-The Virgo weight (0.450) substantially exceeds its expected value on a pisces-signal
-query. Name this tension: what does it mean that the most analytically precise response
-scored highest on a question about meaning-making and symbolic frameworks?
+{delta_instruction}
 Do not summarise the four roles. Synthesise them — the output should say something
 none of them said alone.
 """

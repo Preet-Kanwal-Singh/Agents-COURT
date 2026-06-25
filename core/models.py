@@ -49,6 +49,12 @@ ROLE_KEEP_ALIVE: dict[Role, str] = {
     Role.ARCHIVIST: "15m",   # synthesis is the longest call; keep it resident
 }
 
+ROUTER_MODEL: str = "phi4-mini"   # Stage 2 classifier — deviation from spec (llama3.2:3b);
+                                  # justified by JSON reliability (phi4-mini 5/5 vs llama3.2:3b 2/5
+                                  # on collective_miss). Stage 2 outputs JSON; silent misclassification
+                                  # on malformed output is worse than a slow call.
+ROUTER_TIMEOUT: int = 60          # seconds; Stage 2 is a short classification task
+
 @dataclass
 class RoleResponse:
     role: Role
