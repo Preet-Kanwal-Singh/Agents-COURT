@@ -1,20 +1,23 @@
 """
-Sequential council runner — Phase 2/3/4/5/6.
+Sequential council runner — Phase 2/3/4/5/6/7.
 
 Phase 2: run_sequential
 Phase 3: run_review_round, run_aggregated_review
 Phase 4: run_full_pipeline (non-streaming, CLI entry point)
-Phase 5: run_full_pipeline updated — classification parameter removed, router
-         called internally via classify_query.
+Phase 5: run_full_pipeline updated — router called internally.
 Phase 6: stream_full_pipeline — same pipeline logic as run_full_pipeline
          but yields SSE-ready event dicts and streams the Archivist output
          token-by-token. Sole entry point for the FastAPI layer.
-
-Phase 7 note: swap run_sequential for asyncio.gather here without touching
-anything upstream.
+Phase 7: run_parallel (model-aware asyncio.gather), check_parallel_viable (RAM check).
+         run_full_pipeline and stream_full_pipeline both accept parallel=True
+         (default); fall back to sequential automatically if RAM check fails.
+         run_parallel groups roles by model: same-model roles run sequentially
+         within their group, groups gather concurrently across different models.
+         Avoids same-model timeout failures from naive asyncio.gather.
 """
 from __future__ import annotations
 
+import asyncio
 from statistics import mean
 from typing import Any, AsyncGenerator
 
@@ -35,6 +38,83 @@ from .review import (
 )
 
 COUNCIL_ROLES: list[Role] = [Role.VIRGO, Role.PISCES, Role.CRITIC, Role.SEER]
+
+# Parallel council run loads qwen3:8b (~5GB) + llama3.2:3b (~2GB) + qwen2.5:3b (~2GB)
+# simultaneously — ~9GB model footprint. 12GB available is the conservative threshold,
+# consistent with the brief's "requires 16GB+ total system RAM".
+# Virgo and Pisces share qwen3:8b; that model is loaded once regardless.
+PARALLEL_RAM_THRESHOLD_GB: float = 12.0
+
+
+def check_parallel_viable(threshold_gb: float = PARALLEL_RAM_THRESHOLD_GB) -> tuple[bool, str]:
+    """
+    Returns (viable, reason). Never raises.
+
+    Falls back to sequential (viable=False) on ImportError or any exception.
+    Sequential is always safe; parallel is opportunistic.
+    """
+    try:
+        import psutil
+        available_gb = psutil.virtual_memory().available / (1024 ** 3)
+        if available_gb >= threshold_gb:
+            return True, f"{available_gb:.1f}GB available >= {threshold_gb}GB threshold"
+        return False, f"{available_gb:.1f}GB available < {threshold_gb}GB threshold — using sequential"
+    except ImportError:
+        return False, "psutil not installed — using sequential"
+    except Exception as e:
+        return False, f"RAM check failed ({e}) — using sequential"
+
+
+async def run_parallel(
+    query: str,
+    roles: list[Role] | None = None,
+) -> list[RoleResponse]:
+    """
+    Run council roles concurrently, grouped by model.
+    Roles sharing a model run sequentially within their group; groups are
+    gathered concurrently across different models.
+
+    This avoids the timeout failure that occurs when naive asyncio.gather fires
+    concurrent requests at the same model: Ollama serializes same-model inference
+    internally, so a role queued behind another can exhaust its timeout waiting.
+    Model-aware grouping eliminates that queue while preserving cross-model concurrency.
+
+    Returns responses in COUNCIL_ROLES order regardless of completion order.
+    Never raises — errors are captured in RoleResponse.error.
+
+    Speedup ceiling on the current model lineup: Virgo+Pisces (qwen3:8b) run
+    sequentially within their group while Critic and Seer run concurrently alongside
+    them. Wall-clock gain = time saved on Critic+Seer (~57s on HAMON hardware).
+    """
+    from collections import defaultdict
+    from .models import ROLE_MODELS
+
+    if roles is None:
+        roles = COUNCIL_ROLES
+
+    # Group roles by assigned model, preserving within-group order.
+    model_groups: dict[str, list[Role]] = defaultdict(list)
+    for role in roles:
+        model_groups[ROLE_MODELS[role]].append(role)
+
+    async def _run_group(group_roles: list[Role]) -> list[RoleResponse]:
+        """Run one model group sequentially, returning results in group order."""
+        results = []
+        for role in group_roles:
+            system_prompt = get_system_prompt(role.value)
+            results.append(await call_role(role, system_prompt, query))
+        return results
+
+    # Gather across groups (different models run concurrently).
+    group_results: list[list[RoleResponse]] = list(
+        await asyncio.gather(*[_run_group(g) for g in model_groups.values()])
+    )
+
+    # Flatten and restore caller-specified order.
+    by_role: dict[Role, RoleResponse] = {
+        r.role: r for group in group_results for r in group
+    }
+    return [by_role[role] for role in roles]
 
 
 async def run_sequential(
@@ -177,18 +257,28 @@ async def run_aggregated_review(
 async def run_full_pipeline(
     query: str,
     num_reviewers: int = 4,
+    parallel: bool = True,
 ) -> Any:
     """
-    Full pipeline: router -> sequential council -> aggregated review -> Archivist synthesis.
+    Full pipeline: router -> council -> review -> Archivist synthesis.
     Returns SynthesisResult. CLI entry point — uses non-streaming Archivist call.
 
-    Phase 5: router is called internally; classification parameter removed.
+    parallel=True (default): attempts parallel council execution if RAM check passes,
+    falls back to sequential automatically.
+    parallel=False: forces sequential (useful for debugging or low-RAM machines).
     """
     from .router import run_router
 
     router_result = await run_router(query)
 
-    role_responses = await run_sequential(query)
+    if parallel:
+        viable, reason = check_parallel_viable()
+        if viable:
+            role_responses = await run_parallel(query)
+        else:
+            role_responses = await run_sequential(query)
+    else:
+        role_responses = await run_sequential(query)
 
     aggregated_review = await run_aggregated_review(
         query=query,
@@ -219,6 +309,7 @@ async def run_full_pipeline(
 async def stream_full_pipeline(
     query: str,
     num_reviewers: int = 4,
+    parallel: bool = True,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """
     Full pipeline with streaming Archivist output. Phase 6 API entry point.
@@ -228,19 +319,14 @@ async def stream_full_pipeline(
 
     Event types:
       {"type": "status",  "message": str}
-        — emitted before and after each phase; keeps long-running requests
-          visible to the client during council/review inference.
       {"type": "router",  "data": dict}
-        — router classification + weights + modifiers; emitted once, after
-          router runs, before council. Clients that don't need metadata can
-          filter on type.
       {"type": "token",   "content": str}
-        — one per Archivist generation token; raw (not LaTeX-stripped).
       {"type": "done",    "synthesis": str}
-        — terminal success event; synthesis is the fully assembled and
-          LaTeX-stripped Archivist response.
       {"type": "error",   "message": str}
-        — terminal failure event; emitted and then the generator returns.
+
+    parallel=True (default): attempts parallel council execution if RAM check passes,
+    falls back to sequential automatically. The "status" event before the council
+    run reports which path was taken.
     """
     from .router import run_router
 
@@ -267,10 +353,19 @@ async def stream_full_pipeline(
     }
 
     # ------------------------------------------------------------------ #
-    # Council roles                                                        #
+    # Council roles — parallel if viable, sequential fallback             #
     # ------------------------------------------------------------------ #
-    yield {"type": "status", "message": "Running council roles..."}
-    role_responses = await run_sequential(query)
+    if parallel:
+        viable, reason = check_parallel_viable()
+        if viable:
+            yield {"type": "status", "message": f"Running council roles (parallel — {reason})..."}
+            role_responses = await run_parallel(query)
+        else:
+            yield {"type": "status", "message": f"Running council roles (sequential — {reason})..."}
+            role_responses = await run_sequential(query)
+    else:
+        yield {"type": "status", "message": "Running council roles (sequential)..."}
+        role_responses = await run_sequential(query)
 
     ok_count = sum(1 for r in role_responses if r.ok)
     failed = [r.role.value for r in role_responses if not r.ok]
